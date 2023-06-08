@@ -1,0 +1,305 @@
+---
+geometry: margin=1cm
+output:
+  pdf_document
+papersize: a4
+---
+
+# Doordash Delivery Time Prediction
+
+**Load Data**
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(corrplot)
+library(MASS)
+library(caret)
+library(randomForest)
+library(gbm)
+historical_data<- read.csv(file="～/Desktop/historical_data.csv",
+                           colClasses=c(rep("character",3),rep("numeric",6)))
+predict_data<- read.csv(file="～/Desktop/predict_data.cs",
+                        colClasses=c(rep("character",2),rep("numeric",7)))
+```
+
+
+## a)Data processing — Outlier & missing treatment
+Missing Data Treatment:
+
+- market_id: imputed by finding the “nearest” region with the closest average store-to-consumer driver duration.
+- total_onshift_dashers: imputed with the average total_onshift_dashers at same market id.
+- total_busy_dashers: imputed with the average total_onshift_dashers at same market id
+- total_outstanding_orders: imputed with the average total_onshift_dashers at same market id. 
+Note: Some better imputation methed (i.e. knn imputation, or average by market and hours) can be considered, due to time limitation, we are using this relatively simply imputation techniques.
+
+Outlier treatment: Outliers are capped/floored at 99th/1st percentile to avoid biasing the model spec
+
+```{r message=FALSE, warning=FALSE}
+Average_driving<- historical_data %>%
+  group_by(market_id) %>% 
+  summarise(Average_driving=mean(estimated_store_to_consumer_driving_duration,na.rm=T),n=n())
+historical_data$market_id<- coalesce(historical_data$market_id,"2")
+
+####Imputation Values, will be used for prediction data####
+imputation<- historical_data %>%
+  group_by(market_id) %>%
+    summarize(total_onshift_dashers=mean(total_onshift_dashers,na.rm=T),
+              total_busy_dashers=mean(total_busy_dashers,na.rm=T),
+              total_outstanding_orders=mean(total_outstanding_orders,na.rm=T),
+              estimated_store_to_consumer_driving_duration=mean(estimated_store_to_consumer_driving_duration,na.rm=T))
+  
+historical_data_imp<- historical_data %>% left_join(imputation, by=c('market_id')) %>%
+  mutate(total_onshift_dashers=coalesce(total_onshift_dashers.x,total_onshift_dashers.y),
+         total_busy_dashers=coalesce(total_busy_dashers.x,total_busy_dashers.y),
+         total_outstanding_orders=coalesce(total_outstanding_orders.x,total_outstanding_orders.y),
+         estimated_store_to_consumer_driving_duration=coalesce(estimated_store_to_consumer_driving_duration.x, estimated_store_to_consumer_driving_duration.y)) %>%
+  dplyr::select(one_of(names(historical_data)))
+
+
+Feature<- c("subtotal","total_onshift_dashers","total_busy_dashers","total_outstanding_orders","estimated_store_to_consumer_driving_duration")
+for (var in Feature){
+  assign(var, historical_data %>% summarize(lowerbound=quantile(.[[var]], c(0.01), na.rm=T),
+                                            upperbound=quantile(.[[var]], c(0.99), na.rm=T)))
+  if (var=="subtotal"){Boundary=get(var)} else {Boundary=rbind(Boundary,get(var))}
+}
+row.names(Boundary)<- Feature
+
+historical_data_imp[,Feature]<- sapply(Feature, function(x) pmax(pmin(historical_data_imp[,x],Boundary[x,'upperbound']),Boundary[x,'lowerbound']))
+imputation_present<- imputation
+colnames(imputation_present)<- c("","onshift_dashers","busy_dashers","outstanding_orders","driving_duration")
+kable(imputation_present)
+kable(Boundary)
+```
+
+**Result of Imputation and outlier treatment**
+
+```{r message=FALSE, warning=FALSE}
+percent <- function(x, digits = 2, format = "f", ...) {
+  paste0(formatC(100 * x, format = format, digits = digits, ...), "%")
+}
+
+for (var in Feature){
+  before_processing<- historical_data %>% summarize(min_raw=quantile(.[[var]], c(0), na.rm=T),
+                                            max_raw=quantile(.[[var]], c(1), na.rm=T),
+                                            mean_raw=round(mean(.[[var]],na.rm=T),1),
+                                            coverage_raw=1-mean(is.na(.[[var]])))
+  after_processing<- historical_data_imp %>% summarize(min_after=quantile(.[[var]], c(0), na.rm=T),
+                                            max_after=quantile(.[[var]], c(1), na.rm=T),
+                                            mean_after=round(mean(.[[var]],na.rm=T),1),
+                                            coverage_after=1-mean(is.na(.[[var]])))
+  assign(var, cbind(before_processing, after_processing))
+  if (var=="subtotal"){Statistics=get(var)} else {Statistics=rbind(Statistics,get(var))}
+}
+row.names(Statistics)<- Feature
+Statistics$coverage_raw<- sapply(Statistics$coverage_raw, percent)
+Statistics$coverage_after<- sapply(Statistics$coverage_after, percent)
+kable(Statistics)
+```
+
+## B) Generate New Variables & Univariate Analysis
+
+Following features have been created:
+
+- Seasonality: 1) Time of day 2)Day of week 3)Month of year
+- available dasher: total_onshift_dashers - total_busy_dashers
+- number of dasher per order: total_onshift_dashers/total_outstanding_orders
+- number of available dasher per order: available_dasher/total_outstanding_orders
+(To avoid the value to be infinity, we floored total_outstanding_orders at 1)
+
+**Continuous Variables:**
+```{r message=FALSE, warning=FALSE}
+Modeling_Data<- historical_data_imp %>% 
+  mutate(created_at= strptime(created_at,"%Y-%m-%d %H:%M:%S"),
+         actual_delivery_time= strptime(actual_delivery_time,"%Y-%m-%d %H:%M:%S"),
+         hour=format(created_at,"%H"),
+         day=weekdays(created_at),
+         month=format(created_at,"%m"),
+         delivery_time=as.numeric(difftime(actual_delivery_time,created_at,units = "secs")),
+         
+         available_dasher=pmax(0,total_onshift_dashers-total_busy_dashers),
+         available_dasher_order=available_dasher/pmax(total_outstanding_orders,1),
+         busy_dasher_order= total_busy_dashers/pmax(total_outstanding_orders,1),
+         total_dasher_order=total_onshift_dashers/pmax(total_outstanding_orders,1)) %>%
+  filter(!is.na(delivery_time) & delivery_time<=7200)
+
+
+
+Empirical_Plot<- function(data, var, lower, upper, by, x_break,scale){
+  Rsqure<- round(summary(lm(as.formula(paste0("delivery_time~",var)), Modeling_Data))$r.squared,2)
+  
+  labs=round(seq(lower+by/2, upper-by/2,by), digits=3)
+  data$mid=cut(x=data[,var], breaks=seq(lower, upper, by), labels=labs)
+  delivery= data%>%filter(!is.na(mid)) %>% group_by(mid) %>% summarize(Ave_delivery=mean(delivery_time,na.rm=T), count=n())
+  breaks= labs[x_break]
+  
+  theme_set(theme_bw())
+  ggplot(data=delivery, aes(x=mid))+
+    geom_ribbon(aes(ymin=0,ymax=count/scale, group=1),fill="grey")+
+    geom_line(aes(y=Ave_delivery, group=1), size=1, color='red')+
+    scale_x_discrete(breaks=breaks)+
+    scale_y_continuous(name=expression("Ave Delivery Time"), sec.axis = sec_axis(~.*scale, name="#Obserbation"))+
+    labs(x= paste(var,"|R Squared =",Rsqure))
+  
+}
+
+Empirical_Plot(Modeling_Data,"estimated_store_to_consumer_driving_duration",100,1000,100,c(T),10)
+Empirical_Plot(Modeling_Data,"total_onshift_dashers",0,200,10,c(T),10)
+Empirical_Plot(Modeling_Data,"total_busy_dashers",0,200,10,c(T),10)
+Empirical_Plot(Modeling_Data,"available_dasher",0,50,2,c(T),10)
+Empirical_Plot(Modeling_Data,"subtotal",0,10000,1000,c(T),10)
+Empirical_Plot(Modeling_Data,"total_dasher_order",0,3,0.2,c(T),10)
+Empirical_Plot(Modeling_Data,"available_dasher_order",0,3,0.2,c(T),10)
+Empirical_Plot(Modeling_Data,"busy_dasher_order",0,3,0.2,c(T),10)
+```
+
+**Categorical Variables:**
+```{r message=FALSE, warning=FALSE}
+Empirical_Plot_Cat<- function(data, var,scale){
+  Rsqure<- round(summary(lm(as.formula(paste0("delivery_time~",var)), Modeling_Data))$r.squared,2)
+  Delivery_time= data %>% group_by_(var) %>% summarise(Delivery_time=mean(delivery_time,na.rm=T),Count=n())
+  
+  theme_set(theme_bw())
+  ggplot(data=Delivery_time, aes_string(x=var))+
+    geom_bar(aes(y=Count/scale, group=1), stat = "identity", fill="grey") +
+    geom_point(aes(y=Delivery_time, group=1),size=2, color='red', shape=1)+
+    geom_line(aes(y=Delivery_time,group=1), size=0.8, color='red',linetype="dashed")+
+    scale_y_continuous(name=expression("Ave Delivery Time"), sec.axis = sec_axis(~.*scale, name="#Obserbation"))+
+    labs(x= paste(var,"|R Squared =",Rsqure))
+}
+
+Empirical_Plot_Cat(Modeling_Data,"market_id",10)
+Empirical_Plot_Cat(Modeling_Data,"month",10)
+Empirical_Plot_Cat(Modeling_Data,"day",10)
+Empirical_Plot_Cat(Modeling_Data,"hour",10)
+```
+
+
+## C) Variable transformation & Multivariate Analysis
+
+The variable transformation is mainly for linear regression to ensure the transformed x has a linear relationship with y. Here we using linear spline transformation for continuousvariable. For categorical variable, the dummt encoding will be automated implemented in the model algorithm, so here we dont need to manually transform catergorical variables.
+
+```{r message=FALSE, warning=FALSE}
+Continuous_variables<- c("delivery_time","estimated_store_to_consumer_driving_duration","total_onshift_dashers","total_busy_dashers","available_dasher","subtotal","total_dasher_order","available_dasher_order","busy_dasher_order")
+spearman<- cor(Modeling_Data[,Continuous_variables],method="spearman")
+colnames(spearman)<- c("delivery_time","driving_duration","onshift_dashers","busy_dashers","available_dasher","subtotal","total_dasher_order","available_dasher_order","busy_dasher_order")
+rownames(spearman)<- c("delivery_time","driving_duration","onshift_dashers","busy_dashers","available_dasher","subtotal","total_dasher_order","available_dasher_order","busy_dasher_order")
+corrplot(spearman)
+pearson<- cor(Modeling_Data[,Continuous_variables],method="pearson")
+colnames(pearson)<- c("delivery_time","driving_duration","onshift_dashers","busy_dashers","available_dasher","subtotal","total_dasher_order","available_dasher_order","busy_dasher_order")
+rownames(pearson)<- c("delivery_time","driving_duration","onshift_dashers","busy_dashers","available_dasher","subtotal","total_dasher_order","available_dasher_order","busy_dasher_order")
+corrplot(pearson)
+
+Modeling_Data$total_dasher_order_spline1<- pmin(Modeling_Data$total_dasher_order, 0.7)
+Modeling_Data$total_dasher_order_spline2<- pmin(pmax(Modeling_Data$total_dasher_order, 0.7),1)
+Modeling_Data$total_dasher_order_spline3<- pmax(Modeling_Data$total_dasher_order,1)
+
+```
+
+
+## D) Model development and OOS testing
+
+The data has been split into training and testing sample
+3 models have been tested here: 
+
+- Linear regression
+- Random Forest
+- Gradient Boosting Model
+
+
+```{r message=FALSE, warning=FALSE, eval = FALSE}
+set.seed(10)
+RandomBooleanVector<- rbinom(nrow(Modeling_Data),1,0.7) ==1
+Modeling_Data$market_id<- as.factor(Modeling_Data$market_id)
+Modeling_Data$day<- as.factor(Modeling_Data$day)
+Modeling_Data$hour<- as.factor(Modeling_Data$hour)
+Training<-Modeling_Data[RandomBooleanVector,]
+Testing<- Modeling_Data[!RandomBooleanVector,]
+
+####################RF Model#################
+Formula_LM<- as.formula("delivery_time~estimated_store_to_consumer_driving_duration+total_onshift_dashers+total_busy_dashers+available_dasher+subtotal+available_dasher_order+busy_dasher_order+total_dasher_order_spline1+total_dasher_order_spline2+total_dasher_order_spline3+market_id+day+hour")
+
+
+full_model<- lm(data=Training, formula=Formula_LM)
+null_model<- lm(data=Training, formula=delivery_time~1)
+Training$market_id <- relevel(factor(Training$market_id), ref="2")
+Linear_model<- stepAIC(data=Training, null_model, scope=list(lower=null_model, upper=full_model),direction ="both", trace=FALSE)
+LMRMSE_IS<-RMSE(Linear_model$fitted.values,Training$delivery_time)
+LMRSQ_IS<- (cor(Linear_model$fitted.values,Training$delivery_time))^2
+testPred_LM <- predict(Linear_model , Testing)
+LMRMSE_OOS<-RMSE(testPred_LM,Testing$delivery_time)
+LMRSQ_OOS<- (cor(testPred_LM,Testing$delivery_time))^2
+
+####################RF Model#################
+Varlist<- c("estimated_store_to_consumer_driving_duration","total_onshift_dashers","total_busy_dashers","available_dasher","subtotal","available_dasher_order","busy_dasher_order","total_dasher_order","total_outstanding_orders","market_id","day","hour")
+Formula_RF<- as.formula("delivery_time~estimated_store_to_consumer_driving_duration+total_onshift_dashers+total_busy_dashers+available_dasher+subtotal+available_dasher_order+busy_dasher_order+total_dasher_order+market_id+day+hour")
+
+#Pamameters<- tuneRF(Training[, Varlist], Training[, "delivery_time"], nTreeTry = 50)
+RF_Model<-randomForest(Formula_RF , data=Training, ntree=70, mtry=4, importance=TRUE)
+RFRMSE_IS<-RMSE(RF_Model$predicted,Training$delivery_time)
+RFRSQ_IS<-(cor(RF_Model$predicted,Training$delivery_time))^2
+testPred_RF <- predict(RF_Model , Testing)
+RFRMSE_OOS<- RMSE(testPred_RF,Testing$delivery_time)
+RFRSQ_OOS<- (cor(testPred_RF,Testing$delivery_time))^2
+
+####################GB Model#################
+gbm.fit <- gbm(
+  formula = Formula_RF,
+  distribution = "gaussian",
+  data = Training,
+  n.trees = 10000,
+  interaction.depth = 1,
+  shrinkage = 0.1,
+  cv.folds = 5,
+  n.cores = NULL, # will use all cores by default
+  verbose = FALSE
+  )  
+GBRMSE_IS<- RMSE(gbm.fit$fit,Training$delivery_time)
+GBRSQ_IS<-(cor(gbm.fit$fit,Training$delivery_time))^2
+testPred_GB <- predict(gbm.fit , Testing)
+GBRMSE_OOS<- RMSE(testPred_GB,Testing$delivery_time)
+GBRSQ_OOS<-(cor(testPred_GB,Testing$delivery_time))^2
+
+Result<- data.frame(IS_RSQ=c(LMRSQ_IS,RFRSQ_IS,GBRSQ_IS),IS_RMSE=c(LMRMSE_IS,RFRMSE_IS,GBRMSE_IS),OOS_RSQ=c(LMRSQ_OOS,RFRSQ_OOS,GBRSQ_OOS),OOS_RMSE=c(LMRMSE_OOS,RFRMSE_OOS,GBRMSE_OOS))
+rownames(Result)<- c('Linear Regression','Random Forest','GBM')
+save(Result, file="Result.rda")
+```
+
+**Modeling Output**
+```{r message=FALSE, warning=FALSE}
+load(file="Result.rda")
+kable(Result)
+```
+## E) Model implementation --- Scoring preidct data
+
+```{r message=FALSE, warning=FALSE, eval = FALSE}
+predict_data$market_id<- coalesce(predict_data$market_id,"2")
+predict_data_imp<- predict_data %>% left_join(imputation, by=c('market_id')) %>%
+  mutate(total_onshift_dashers=coalesce(total_onshift_dashers.x,total_onshift_dashers.y),
+         total_busy_dashers=coalesce(total_busy_dashers.x,total_busy_dashers.y),
+         total_outstanding_orders=coalesce(total_outstanding_orders.x,total_outstanding_orders.y),
+         estimated_store_to_consumer_driving_duration=coalesce(estimated_store_to_consumer_driving_duration.x, estimated_store_to_consumer_driving_duration.y)) %>%
+  dplyr::select(one_of(names(predict_data)))
+  
+Feature<- c("subtotal","total_onshift_dashers","total_busy_dashers","total_outstanding_orders","estimated_store_to_consumer_driving_duration")
+predict_data_imp[,Feature]<- sapply(Feature, function(x) pmax(pmin(predict_data_imp[,x],Boundary[x,'upperbound']),Boundary[x,'lowerbound']))
+
+predict_data_var<- predict_data_imp %>% 
+  mutate(created_at= strptime(created_at,"%Y-%m-%d %H:%M:%S"),
+         hour=format(created_at,"%H"),
+         day=weekdays(created_at),
+         month=format(created_at,"%m"),
+         
+         available_dasher=pmax(0,total_onshift_dashers-total_busy_dashers),
+         available_dasher_order=available_dasher/pmax(total_outstanding_orders,1),
+         busy_dasher_order= total_busy_dashers/pmax(total_outstanding_orders,1),
+         total_dasher_order=total_onshift_dashers/pmax(total_outstanding_orders,1))
+
+
+predict_data_var$market_id<- as.factor(predict_data_var$market_id)
+predict_data_var$day<- as.factor(predict_data_var$day)
+predict_data_var$hour<- as.factor(predict_data_var$hour)
+
+predict_data_var$predicted_duration<- predict(RF_Model , predict_data_var)
+write.csv(predict_data_var, file="predict_data.csv")
+```
